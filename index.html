@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Solucionador Wordle — Pro</title>
+<style>
+:root{--bg:#f3f4f6;--fg:#111;--tile:#d3d6da;--correct:#6aaa64;--present:#c9b458;--absent:#787c7e;--accent:#0077c8;--warn:#c1121f;--radius:.5rem}
+*{box-sizing:border-box;margin:0}
+body{max-width:64rem;margin:auto;padding:2rem;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+h1{text-align:center;margin-bottom:1.2rem;font-size:2rem}
+button{padding:.6rem 1.2rem;border:none;border-radius:var(--radius);background:var(--accent);color:#fff;font-size:1rem;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.15)}
+button[disabled]{opacity:.35;cursor:not-allowed}
+input[type=text]{width:8.5rem;padding:.45rem;font-size:1.1rem;text-transform:uppercase;text-align:center;border:1px solid #bbb;border-radius:var(--radius)}
+.flex{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem}
+#status{font-style:italic;margin:.4rem 0}
+#warn{color:var(--warn);font-weight:bold;display:none;margin-top:.6rem}
+pre{background:#fff;border:1px solid #e5e7eb;border-radius:var(--radius);padding:1rem;max-height:18rem;overflow:auto;font-size:.9rem}
+#guess{font-size:1.8rem;font-weight:bold;letter-spacing:.08em;margin:1rem 0;text-align:center}
+.tiles{display:flex;gap:.4rem;justify-content:center;margin-bottom:1rem}
+.tile{width:3rem;height:3rem;display:flex;align-items:center;justify-content:center;font-size:1.4rem;font-weight:bold;border-radius:var(--radius);background:var(--tile);color:#fff;user-select:none;cursor:pointer;transition:background .2s}
+.correct{background:var(--correct)!important}.present{background:var(--present)!important}.absent{background:var(--absent)!important}
+summary{cursor:pointer;font-weight:bold;margin-top:.8rem;font-size:1rem}
+details>summary::-webkit-details-marker{display:none}
+canvas{max-width:300px;margin-top:1rem}
+</style>
+</head>
+<body>
+<h1>Solucionador Wordle — Pro</h1>
+<div class="flex">
+  <button id="startBtn" disabled>Palabra aleatoria</button>
+  <input id="customWord" type="text" maxlength="5" placeholder="PALABRA" disabled>
+  <button id="customBtn" disabled>Empezar con mi palabra</button>
+</div>
+<div id="guess"></div>
+<div id="feedbackArea" class="tiles" style="visibility:hidden"></div>
+<div class="flex">
+  <label for="fb">B/M/C:</label>
+  <input id="fb" type="text" maxlength="5" disabled>
+  <button id="nextBtn" disabled>Siguiente</button>
+  <button id="retryBtn" disabled>Otra palabra</button>
+  <button id="solvedBtn" disabled>He acertado</button>
+  <button id="failedBtn" disabled>No acerté</button>
+</div>
+<div id="status">Cargando diccionario…</div>
+<div id="warn"></div>
+<pre id="log"></pre>
+<details open>
+  <summary>Historial</summary>
+  <div id="history"></div>
+</details>
+<section id="stats" style="display:none">
+  <h2>Estadísticas</h2>
+  <canvas id="statsChart"></canvas>
+</section>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script>
+document.addEventListener('DOMContentLoaded',()=>{
+/********** Elementos **********/
+const $=id=>document.getElementById(id);
+const startBtn=$("startBtn"), customWord=$("customWord"), customBtn=$("customBtn"),
+      guessDiv=$("guess"), feedbackArea=$("feedbackArea"), fbIn=$("fb"), nextBtn=$("nextBtn"),
+      retryBtn=$("retryBtn"), solvedBtn=$("solvedBtn"), failedBtn=$("failedBtn"),
+      statusDiv=$("status"), warnDiv=$("warn"), logArea=$("log"), historyBox=$("history"),
+      statsSection=$("stats"), statsCanvas=$("statsChart");
+/********** Diccionario **********/
+const SOURCES=[
+  "https://raw.githubusercontent.com/javierarce/palabras/master/listado-general.txt",
+  "https://raw.githubusercontent.com/jorgegonzalez/bnlp/master/bnlp/resources/spanish_wordle_list/soluciones.txt"
+];
+let WORDS=new Set();
+const clean=w=>w.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
+async function fetchAndAdd(u){
+  try{
+    const t=await (await fetch(u)).text();
+    t.split(/\r?\n/).forEach(r=>{
+      const w=clean(r.trim());
+      if(w.length===5&&/^[a-zñ]+$/.test(w)) WORDS.add(w);
+    });
+  }catch(e){console.warn(u,e)}
+}
+(async()=>{
+  await Promise.all(SOURCES.map(fetchAndAdd));
+  if(!WORDS.size){
+    ['salir','poder','ratio','campo','tarde'].forEach(w=>WORDS.add(w));
+    statusDiv.textContent='Offline: lista mínima';
+  }else{
+    statusDiv.textContent=`${WORDS.size} palabras cargadas.`;
+  }
+  [startBtn,customBtn,customWord].forEach(b=>b.disabled=false);
+})();
+/********** Estado **********/
+const alphabet=[..."abcdefghijklmnñopqrstuvwxyz"], COLORS=['absent','present','correct'];
+let candidates=[],turn=0,lastGuess="",currentGame=null,gameHistory=[],chart=null;
+const state={fixed:Array(5).fill(null),min:{},max:{}};
+const forbidPos=Array(5).fill(0).map(()=>new Set());
+/********** Utilidades **********/
+const log=m=>{logArea.textContent+=m+"\n";logArea.scrollTop=logArea.scrollHeight};
+const freq=w=>[...w].reduce((o,c)=>(o[c]=(o[c]||0)+1,o),{});
+const bestGuess=ws=>ws[Math.floor(Math.random()*ws.length)];
+function reset(){
+  candidates=[...WORDS];
+  turn=0;
+  lastGuess='';
+  state.fixed.fill(null);
+  state.min={};
+  state.max={};
+  forbidPos.forEach(s=>s.clear());
+  logArea.textContent='';
+  warnDiv.style.display='none';
+  feedbackArea.innerHTML='';
+  feedbackArea.style.visibility='hidden';
+  fbIn.value='MMMMM';
+  fbIn.placeholder='MMMMM';
+}
+/********** Tiles interacción **********/
+/* Nueva versión: mantiene en verde las posiciones ya confirmadas como correctas */
+function buildTiles(){
+  feedbackArea.innerHTML='';
+  for(let i=0;i<5;i++){
+    const d=document.createElement('div');
+    const isFixed=state.fixed[i]!==null;             // ¿ya confirmada la posición?
+    d.className='tile '+(isFixed?'correct':'absent');
+    d.textContent=lastGuess[i].toUpperCase();
+    d.onclick=()=>{cycleTile(d)};
+    feedbackArea.appendChild(d);
+  }
+  feedbackArea.style.visibility='visible';
+  syncFromTiles();                                   // actualiza el campo fbIn
+}
+function cycleTile(t){
+  const cls=COLORS.find(c=>t.classList.contains(c));
+  t.classList.replace(cls,COLORS[(COLORS.indexOf(cls)+1)%3]);
+  syncFromTiles();
+}
+const tileToChar={'correct':'B','present':'C','absent':'M'};
+function syncFromTiles(){
+  fbIn.value=[...feedbackArea.children]
+             .map(t=>tileToChar[[...t.classList].find(c=>COLORS.includes(c))])
+             .join('');
+}
+function syncTilesFromInput(){
+  if(fbIn.value.length!==5) return;
+  [...feedbackArea.children].forEach((t,i)=>{
+    t.classList.remove(...COLORS);
+    t.classList.add({'B':'correct','C':'present','M':'absent'}[fbIn.value[i]]||'absent');
+  });
+}
+/********** Validación **********/
+fbIn.addEventListener('input',()=>{
+  fbIn.value=fbIn.value.toUpperCase().replace(/[^BMC]/g,'');
+  syncTilesFromInput();
+});
+/********** Lógica Wordle **********/
+function applyFB(g,fb){
+  const minLocal={};
+  for(let i=0;i<5;i++){
+    const ch=g[i],f=fb[i];
+    if(f==='B'){
+      state.fixed[i]=ch;
+      forbidPos[i].clear();
+      minLocal[ch]=(minLocal[ch]||0)+1;
+    }else if(f==='C'){
+      forbidPos[i].add(ch);
+      minLocal[ch]=(minLocal[ch]||0)+1;
+    }else{
+      forbidPos[i].add(ch);
+    }
+  }
+  for(const l in minLocal) state.min[l]=Math.max(state.min[l]||0,minLocal[l]);
+  for(let i=0;i<5;i++){
+    if(fb[i]==='M'){
+      const ch=g[i];
+      state.max[ch]=(state.max[ch]===undefined)
+        ? (state.min[ch]||0)
+        : Math.min(state.max[ch],state.min[ch]||0);
+    }
+  }
+}
+const acceptable=w=>{
+  for(let i=0;i<5;i++){
+    if(state.fixed[i]&&w[i]!==state.fixed[i]) return false;
+    if(forbidPos[i].has(w[i])) return false;
+  }
+  const f=freq(w);
+  for(const l in state.min) if((f[l]||0)<state.min[l]) return false;
+  for(const l in state.max) if((f[l]||0)>state.max[l]) return false;
+  return true;
+};
+const filter=()=>{candidates=candidates.filter(acceptable)};
+/********** Historial y estadísticas **********/
+function renderHistory(){
+  historyBox.innerHTML='';
+  gameHistory.forEach((g,i)=>{
+    const d=document.createElement('details');
+    const s=document.createElement('summary');
+    s.textContent=`Partida ${i+1}: ${g.status.toUpperCase()} en ${g.attempts.length} intentos`;
+    d.appendChild(s);
+    const pre=document.createElement('pre');
+    g.attempts.forEach((a,idx)=>pre.textContent+=`${idx+1}. ${a.guess.toUpperCase()} → ${a.fb}\n`);
+    d.appendChild(pre);
+    historyBox.appendChild(d);
+  });
+  updateStats();
+}
+function updateStats(){
+  const total=gameHistory.length,
+        win=gameHistory.filter(g=>g.status==='ganada').length,
+        lose=total-win;
+  if(!total){statsSection.style.display='none';return;}
+  statsSection.style.display='block';
+  if(chart) chart.destroy();
+  chart=new Chart(statsCanvas,{
+    type:'doughnut',
+    data:{
+      labels:['Ganadas','Perdidas'],
+      datasets:[{data:[win,lose],backgroundColor:['#6aaa64','#c1121f']}]
+    },
+    options:{plugins:{legend:{position:'bottom'}}}
+  });
+}
+/********** Flujo de partida **********/
+function startGame(init){
+  reset();
+  turn=1;
+  lastGuess=init||bestGuess(candidates);
+  guessDiv.textContent=`Intento 1: ${lastGuess.toUpperCase()}`;
+  buildTiles();
+  [nextBtn,retryBtn,solvedBtn,failedBtn,fbIn].forEach(b=>b.disabled=false);
+  currentGame={status:'en curso',attempts:[]};
+  log(`▶ ${candidates.length} candidatas.`);
+}
+function finalize(status){
+  currentGame.status=status;
+  gameHistory.push(currentGame);
+  renderHistory();
+  [nextBtn,retryBtn,solvedBtn,failedBtn,fbIn].forEach(b=>b.disabled=true);
+}
+/********** Eventos UI **********/
+startBtn.onclick=()=>startGame();
+customBtn.onclick=()=>{
+  const w=clean(customWord.value.trim());
+  if(!/^[a-zñ]{5}$/.test(w)) return alert('5 letras');
+  startGame(w);
+};
+nextBtn.onclick=()=>{
+  let fb=fbIn.value.trim();
+  if(fb.length===0) fb='MMMMM';
+  if(fb.length!==5) return alert('Completa 5 caracteres');
+  currentGame.attempts.push({guess:lastGuess,fb});
+  if(fb==='BBBBB'){
+    guessDiv.textContent=`¡Resuelto en ${turn} intento!`;
+    finalize('ganada');
+    return;
+  }
+  applyFB(lastGuess,fb);
+  filter();
+  if(!candidates.length){
+    warnDiv.textContent='Sin candidatos.';
+    warnDiv.style.display='block';
+    finalize('perdida');
+    return;
+  }
+  turn++;
+  lastGuess=bestGuess(candidates);
+  guessDiv.textContent=`Intento ${turn}: ${lastGuess.toUpperCase()}`;
+  buildTiles();
+};
+retryBtn.onclick=()=>{
+  candidates=candidates.filter(w=>w!==lastGuess);
+  if(!candidates.length) return;
+  lastGuess=bestGuess(candidates);
+  guessDiv.textContent=`Intento ${turn}: ${lastGuess.toUpperCase()}`;
+  buildTiles();
+};
+solvedBtn.onclick=()=>{
+  finalize('ganada');
+  guessDiv.textContent='¡Marcada como acertada!';
+};
+failedBtn.onclick=()=>{
+  finalize('perdida');
+  guessDiv.textContent='Marcada como fallada.';
+};
+});
+</script>
+</body>
+</html>
